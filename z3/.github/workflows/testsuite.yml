@@ -1,0 +1,30 @@
+name: Tests
+on: [push]
+jobs:
+  test:
+    name: Download z3 and test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        z3_release:
+          - https://github.com/Z3Prover/z3/releases/download/z3-4.8.12/z3-4.8.12-x64-glibc-2.31.zip
+          - https://github.com/Z3Prover/z3/releases/download/z3-4.8.11/z3-4.8.11-x64-glibc-2.31.zip
+          - https://github.com/Z3Prover/z3/releases/download/z3-4.8.10/z3-4.8.10-x64-ubuntu-18.04.zip
+          - https://github.com/Z3Prover/z3/releases/download/z3-4.8.9/z3-4.8.9-x64-ubuntu-16.04.zip
+    steps:
+      - uses: actions/checkout@v2
+      - uses: haskell/actions/setup@v1
+        with:
+          ghc-version: '8.10'
+          cabal-version: '3.2'
+      - run: |
+          echo "z3_url=${{matrix.z3_release}}" >> $GITHUB_ENV
+          echo "z3_dir=$(basename ${{matrix.z3_release}} .zip)" >> $GITHUB_ENV
+      - run: |
+          cd $HOME
+          wget ${{env.z3_url}}
+          unzip ${{env.z3_dir}}.zip
+      - run: |
+          cabal --enable-executable-dynamic --extra-include-dirs="$HOME/${{env.z3_dir}}/include" --extra-lib-dirs="$HOME/${{env.z3_dir}}/bin" run
+
