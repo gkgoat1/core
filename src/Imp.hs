@@ -2,6 +2,7 @@ module Imp where
 
 import           Data.Int    (Int32)
 import           Data.String (IsString (..))
+import qualified Z3.Monad      as Z3
 
 -- | The int parameter makes it easy to create new versions of a
 -- variable.
@@ -15,10 +16,19 @@ type Scope = [(Name, Int32)]
 
 data AExp = Lit Int32
           | Var Name
+          | All
           | AExp :+: AExp
           | AExp :-: AExp
           | AExp :*: AExp
-          | AExp :/: AExp deriving (Show, Eq)
+          | AExp :/: AExp 
+          | Bracket Cmd Name
+          | SetA Name AExp 
+          | Raw (Z3.Z3 Z3.AST)
+          | Call Name [AExp]
+          | FnPtr Name Int32 
+          | Load Int32 
+          | Store Int32 Int32 
+          | Bound BExp deriving (Show, Eq)
 
 data BExp = True'
           | False'
@@ -30,9 +40,12 @@ data BExp = True'
 
 data Cmd = Skip
          | Set Name AExp
+         | Do AExp
+         | Fn Name Cmd [Name]
          | Seq Cmd Cmd
          | If BExp Cmd Cmd
          | While BExp Cmd deriving (Show, Eq)
+
 
 evalAExp :: Scope -> AExp -> Maybe Int32
 evalAExp _ (Lit i)        = Just i

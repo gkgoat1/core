@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase     #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE TupleSections #-}
 module ImpToZ3 where
 
 import           Control.Monad (foldM, forM_, (=<<))
@@ -12,9 +13,12 @@ import           Z3.Monad      (AST, Z3, (+?))
 import qualified Z3.Monad      as Z3
 
 import           Imp
+import Data.Either
+import Data.Sequence (mapWithIndex)
+import ImpToZ3 (makeFnTab)
 
-type Z3Var = AST
-
+type Z3Var = (Either AST (Z3.FuncDecl,AST))
+data Z3State = Z3State {mem :: AST}
 type Vars = Map Name Z3Var
 
 getZ3Var :: Name -> Vars -> Z3Var
@@ -29,6 +33,11 @@ makeVars :: [Name] -> Z3 Vars
 makeVars names = foldM addVar Map.empty names
   where addVar vars name = do var <- makeVar name
                               return (Map.insert name var vars)
+makeFnTab scope = Map.fromList $ (zip [0..] $ map (\(x,y) -> (x,fromRight undefined y)) $ filter (\(x,y) -> isRight y) Map.elems scope) >>= (\(i,(k,v)) -> [((k,v),i)])
+
+fnIdAt scope val = makeFnTab scope Map.!! (scope Map.!! val)
+
+makeFnTabSwitch scope val target args = (Map.elems $ makeFnTab scope) >>= (\((k,v),i) x -> Seq x (If (val :==: (Lit i)) (Set target (Call (Z3.name k) args) )))
 
 width :: Int
 width = 32
@@ -50,44 +59,113 @@ unroll bound = \case
 op :: (AST -> AST -> Z3 AST) -> Z3 AST -> Z3 AST -> Z3 AST
 op f a b = do a' <- a; b' <- b; f a' b'
 
-aexp :: Vars -> AExp -> Z3 AST
 aexp scope = \case
-  Lit n       -> Z3.mkBvNum width n
-  Var name    -> return . fromJust $ Map.lookup name scope
-  e_1 :+: e_2 -> op Z3.mkBvadd (aexp scope e_1) (aexp scope e_2)
-  e_1 :-: e_2 -> op Z3.mkBvsub (aexp scope e_1) (aexp scope e_2)
-  e_1 :*: e_2 -> op Z3.mkBvmul (aexp scope e_1) (aexp scope e_2)
-  e_1 :/: e_2 -> op Z3.mkBvsdiv (aexp scope e_1) (aexp scope e_2)
+  Lit n       -> Z3.mkBvNum width n >>= (\x -> return (x,scope))
+  Var name    -> return . (\x -> (x,scope)) . fromLeft undefined . fromJust $ Map.lookup name scope
+  e_1 :+: e_2 -> do
+    (v_1, scope') <- aexp scope e_1
+    (v_2,scope'') <- aexp scope' e_2
+    op Z3.mkBvadd (return v_1) (return v_2) >>= (\x -> return (x,scope''))
+  e_1 :-: e_2 -> do
+    (v_1, scope') <- aexp scope e_1
+    (v_2,scope'') <- aexp scope' e_2
+    op Z3.mkBvsub (return v_1) (return v_2) >>= (\x -> return (x,scope''))
+  e_1 :*: e_2 -> do
+    (v_1, scope') <- aexp scope e_1
+    (v_2,scope'') <- aexp scope' e_2
+    op Z3.mkBvmul (return v_1) (return v_2) >>= (\x -> return (x,scope''))
+  e_1 :/: e_2 -> do
+    (v_1, scope') <- aexp scope e_1
+    (v_2,scope'') <- aexp scope' e_2
+    op Z3.mkBvsdiv (return v_1) (return v_2) >>= (\x -> return (x,scope''))
+  Bracket c n -> cmd scope c >>= (\s -> return $ (fromLeft undefined $ fromJust $ Map.lookup n s,s))
+  SetA name val -> do (newVal,scope') <- aexp scope val
+                      newVar <- makeVar name
+                      Z3.assert =<< Z3.mkEq newVar newVal
+                      return $ (newVar,Map.insert name (Left newVar) scope')
+  Call name args -> case fromJust $ Map.lookup name scope of
+    Right x -> func (x) (mapM (aexp scope) args) scope
+    Left y -> aexp scope $ Bracket (makeFnTabSwitch scope y "_target" args) "_target"
+  FnPtr name r -> if r == 0 then 
+    makeFnTab scope Map.!! (fromRight undefined $ fromJust $ Map.lookup n s) else
+      get >>= (\x -> x ! (len x - r + 1)) >>= (\s -> makeFnTab s Map.!! (fromRight undefined $ fromJust $ Map.lookup n s))
+  Raw x -> x >>= (\y -> return (y,scope))
+  Load x -> do
+    (v,scope') <- aexp scope x
+    g <- get
+    let m = mem g
+    l <- Z3.mkSelect m v
+    return (l,scope')
+  Store x y -> do
+    (v,scope') <- aexp scope x
+    (vt,scope'') <- aexp scope' y
+    g <- get
+    let m = mem g
+    n <- Z3.mkStore m x y
+    modify (\x -> x{mem = n})
+    return (vt,scope'')
+  All -> mkVar width >>= (\x -> return (x,scope))
+  Bound b -> do
+    (c,scope') <- bexp scope b
+    Z3.assert =<< c
+    Z3.mkBvNum width 1 >>= (\x -> return (x,scope))
 
 
-bexp :: Vars -> BExp -> Z3 AST
+
 bexp scope = \case
-  True'        -> Z3.mkBool True
-  False'       -> Z3.mkBool False
-  e_1 :<=: e_2 -> op Z3.mkBvsle (aexp scope e_1) (aexp scope e_2)
-  e_1 :==: e_2 -> op Z3.mkEq (aexp scope e_1) (aexp scope e_2)
-  b_1 :|: b_2  -> do b_1 <- bexp scope b_1
-                     b_2 <- bexp scope b_2
-                     Z3.mkOr [b_1, b_2]
-  b_1 :&: b_2  -> do b_1 <- bexp scope b_1
-                     b_2 <- bexp scope b_2
-                     Z3.mkAnd [b_1, b_2]
-  Not b        -> Z3.mkNot =<< bexp scope b
+  True'        -> Z3.mkBool True >>= (\x -> return (x,scope))
+  False'       -> Z3.mkBool False >>= (\x -> return (x,scope))
+  e_1 :<=: e_2 -> do
+    (v_1, scope') <- aexp scope e_1
+    (v_2,scope'') <- aexp scope' e_2
+    op Z3.mkBvsle (return v_1) (return v_2) >>= (\x -> return (x,scope''))
+  e_1 :==: e_2 -> do
+    (v_1, scope') <- aexp scope e_1
+    (v_2,scope'') <- aexp scope' e_2
+    op Z3.mkEq (return v_1) (return v_2) >>= (\x -> return (x,scope''))
+  b_1 :|: b_2  -> do (b_1,scope') <- bexp scope b_1
+                     (b_2,scope'') <- bexp scope' b_2
+                     Z3.mkOr [b_1, b_2] >>= (\x -> return (s,scope''))
+  b_1 :&: b_2  -> do (b_1,scope') <- bexp scope b_1
+                     (b_2,scope'') <- bexp scope' b_2
+                     Z3.mkAnd [b_1, b_2] >>= (\x -> return (s,scope''))
+  Not b        -> do 
+    (b,scope') <- bexp scope b
+    n <- Z3.mkNot b
+    return (n,scope')
+func fn args inputs = do
+  let (zfn,ret) = fn
+  a <- Z3.mkApp zfn $ map (\x -> fromLeft undefined $ fromJust $ Map.lookup x inputs) args
+  nv <- makeVar $ Name "Return"
+  Z3.assert  =<< Z3.mkEq a nv
+  Z3.assert =<< Z3.mkEq nv ret
+  return nv
 
-cmd :: Vars -> Cmd -> Z3 Vars
+newZfn name cmd' args = do
+  a <- mapM (const $ Z3.mkBvSort width) args
+  b <- Z3.mkBvSort width
+  c <- Z3.mkFuncDecl name (a) $ b
+  modify (++[Map.fromList $ (mapWithIndex (\a b -> (b,Raw $ getAppArg a)) args ++ [("self",Right (c,d))])])
+  d <- cmd (Map.fromList $ (mapWithIndex (\a b -> (b,Raw $ getAppArg a)) args ++ [("self",Right (c,d))])) cmd' >>= (\(a,_) -> a)
+  modify (head)
+  return (c,d)
+
 cmd inputs = compile inputs . unroll bound
   where compile scope = \case
           Skip            -> return scope
-          Set name val    -> do newVal <- aexp scope val
+          Set name val    -> do (newVal,scope') <- aexp scope val
                                 newVar <- makeVar name
                                 Z3.assert =<< Z3.mkEq newVar newVal
-                                return $ Map.insert name newVar scope
+                                return $ Map.insert name newVar scope'
+          Fn name cmd args -> do nfn <- newZfn name cmd args
+                                 return $ Map.insert name (Right $ nfn) scope
           Seq c_1 c_2     -> do scope'  <- compile scope c_1
                                 compile scope' c_2
-          If cond c_1 c_2 -> do cond'   <- bexp scope cond
-                                scope'  <- compile scope c_1
-                                scope'' <- compile scope c_2
-                                makePhis cond' scope scope' scope''
+          Do x -> aexp scope x >>= (\(_,y) -> return $ y)
+          If cond c_1 c_2 -> do (cond',scope')   <- bexp scope cond
+                                scope''  <- compile scope' c_1
+                                scope''' <- compile scope' c_2
+                                makePhis cond' scope scope'' scope'''
           _               -> error "Loops have to be unrolled before compiling to SMT!"
 
 constrainVars :: Map Name Int -> Vars -> Z3 ()
